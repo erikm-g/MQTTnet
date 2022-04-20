@@ -31,6 +31,7 @@ namespace MQTTnet.Extensions.ManagedClient
         readonly Dictionary<string, MqttQualityOfServiceLevel> _reconnectSubscriptions = new Dictionary<string, MqttQualityOfServiceLevel>();
 
         readonly Dictionary<string, MqttQualityOfServiceLevel> _subscriptions = new Dictionary<string, MqttQualityOfServiceLevel>();
+        int _subscriptionHandlers;
         readonly HashSet<string> _unsubscriptions = new HashSet<string>();
         readonly SemaphoreSlim _subscriptionsQueuedSignal = new SemaphoreSlim(0);
 
@@ -391,6 +392,15 @@ namespace MQTTnet.Extensions.ManagedClient
 
                     cancellationToken.ThrowIfCancellationRequested();
 
+                    bool unhandledSubscriptions;
+                    lock (_subscriptions)
+                        unhandledSubscriptions = _subscriptions.Count > 0 || _subscriptionHandlers > 0; 
+                    if (unhandledSubscriptions)
+                    {
+                        await Task.Delay(1, cancellationToken);
+                        continue;
+                    }
+
                     await TryPublishQueuedMessageAsync(message).ConfigureAwait(false);
                 }
             }
@@ -488,44 +498,53 @@ namespace MQTTnet.Extensions.ManagedClient
                         Topic = i.Key, 
                         QualityOfServiceLevel = i.Value
                     }).ToList();
-                    
+
                     _subscriptions.Clear();
                     
                     unsubscriptions = new HashSet<string>(_unsubscriptions);
                     _unsubscriptions.Clear();
+                    Interlocked.Increment(ref _subscriptionHandlers);
                 }
 
-                if (!subscriptions.Any() && !unsubscriptions.Any())
+                try
                 {
-                    continue;
-                }
-
-                _logger.Verbose("Publishing {0} added and {1} removed subscriptions", subscriptions.Count, unsubscriptions.Count);
-
-                foreach (var unsubscription in unsubscriptions)
-                {
-                    _reconnectSubscriptions.Remove(unsubscription);
-                }
-
-                foreach (var subscription in subscriptions)
-                {
-                    _reconnectSubscriptions[subscription.Topic] = subscription.QualityOfServiceLevel;
-                }
-
-                var addedTopicFilters = new List<MqttTopicFilter>();
-                foreach (var subscription in subscriptions)
-                {
-                    addedTopicFilters.Add(subscription);
-                    
-                    if (addedTopicFilters.Count == Options.MaxTopicFiltersInSubscribeUnsubscribePackets)
+                    if (!subscriptions.Any() && !unsubscriptions.Any())
                     {
-                        await SendSubscribeUnsubscribe(addedTopicFilters, null).ConfigureAwait(false);
-                        addedTopicFilters.Clear();
+                        Interlocked.Decrement(ref _subscriptionHandlers);
+                        continue;
                     }
+
+                    _logger.Verbose("Publishing {0} added and {1} removed subscriptions", subscriptions.Count, unsubscriptions.Count);
+
+                    foreach (var unsubscription in unsubscriptions)
+                    {
+                        _reconnectSubscriptions.Remove(unsubscription);
+                    }
+
+                    foreach (var subscription in subscriptions)
+                    {
+                        _reconnectSubscriptions[subscription.Topic] = subscription.QualityOfServiceLevel;
+                    }
+
+                    var addedTopicFilters = new List<MqttTopicFilter>();
+                    foreach (var subscription in subscriptions)
+                    {
+                        addedTopicFilters.Add(subscription);
+                    
+                        if (addedTopicFilters.Count == Options.MaxTopicFiltersInSubscribeUnsubscribePackets)
+                        {
+                            await SendSubscribeUnsubscribe(addedTopicFilters, null).ConfigureAwait(false);
+                            addedTopicFilters.Clear();
+                        }
+                    }
+
+                    await SendSubscribeUnsubscribe(addedTopicFilters, null).ConfigureAwait(false);
                 }
-
-                await SendSubscribeUnsubscribe(addedTopicFilters, null).ConfigureAwait(false);
-
+                finally
+                {
+                    Interlocked.Decrement(ref _subscriptionHandlers);
+                }
+                
                 var removedTopicFilters = new List<string>();
                 foreach (var unSub in unsubscriptions)
                 {
